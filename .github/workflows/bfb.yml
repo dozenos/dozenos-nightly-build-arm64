@@ -19,6 +19,12 @@
 name: Build BF2 BFB
 
 on:
+  # Auto-chain: after the nightly publishes a release (with the dpu qcow2),
+  # wrap it into a .bfb on the same release. So a fresh kernel/disk flows all
+  # the way to a bootable BFB overnight without a manual step.
+  workflow_run:
+    workflows: ["DozenOS arm64 nightly build"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       release_tag:
@@ -31,9 +37,9 @@ on:
         default: 'deb [trusted=yes] https://linux.mellanox.com/public/repo/doca/latest/debian12/arm64-sbsa/ ./'
         type: string
       bootimages_url:
-        description: 'URL of the mlxbf-bootimages(-signed) arm64 .deb (provides default.bfb). Per BF2 generation, not per board.'
+        description: 'URL of the mlxbf-bootimages(-signed) arm64 .deb (provides default.bfb + capsule). Per BF2 generation, not per board. Pin a recent DOCA build so a push does not downgrade the DPU firmware (a 4.11 base was seen to revert a 4.15 board).'
         required: true
-        default: 'https://linux.mellanox.com/public/repo/bluefield/latest/bootimages/prod/mlxbf-bootimages-signed_4.11.0-13611_arm64.deb'
+        default: 'https://linux.mellanox.com/public/repo/doca/latest/debian13/arm64-dpu/mlxbf-bootimages-signed_4.15.0-13977_arm64.deb'
         type: string
 
 permissions:
@@ -45,8 +51,17 @@ concurrency:
 
 jobs:
   build-bfb:
+    # On workflow_run only proceed if the nightly succeeded; always run on manual
+    # dispatch. (workflow_run carries no inputs, so the steps fall back to the
+    # workflow_dispatch defaults below.)
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
+    env:
+      DOCA_REPO: ${{ inputs.doca_repo || 'deb [trusted=yes] https://linux.mellanox.com/public/repo/doca/latest/debian12/arm64-sbsa/ ./' }}
+      BOOTIMAGES_URL: ${{ inputs.bootimages_url || 'https://linux.mellanox.com/public/repo/doca/latest/debian13/arm64-dpu/mlxbf-bootimages-signed_4.15.0-13977_arm64.deb' }}
     steps:
       - name: Checkout dozenos-rebrand-arm64 (bfb/ scripts)
         uses: actions/checkout@v7
@@ -59,7 +74,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y qemu-utils zstd busybox-static cpio gzip \
-            gdisk kpartx ca-certificates wget
+            gdisk kpartx ca-certificates wget efibootmgr pv
 
       # Two public NVIDIA sources (both per BF2 generation, not per board):
       #  - mlx-mkbfb ships in the DOCA repo's `rshim` package (/usr/sbin).
@@ -69,14 +84,14 @@ jobs:
       - name: Install mlx-mkbfb (DOCA rshim) + default.bfb (mlxbf-bootimages)
         run: |
           set -euo pipefail
-          echo "${{ inputs.doca_repo }}" | sudo tee /etc/apt/sources.list.d/doca.list
+          echo "$DOCA_REPO" | sudo tee /etc/apt/sources.list.d/doca.list
           sudo apt-get update
           sudo apt-get install -y rshim
           MKBFB=$(command -v mlx-mkbfb || echo /usr/sbin/mlx-mkbfb)
           test -x "$MKBFB" || { echo "::error::mlx-mkbfb not found in the DOCA rshim package"; exit 1; }
           echo "MKBFB=$MKBFB" >> "$GITHUB_ENV"
 
-          wget -qO bootimages.deb "${{ inputs.bootimages_url }}"
+          wget -qO bootimages.deb "$BOOTIMAGES_URL"
           sudo dpkg -i bootimages.deb || sudo apt-get -y -f install
           test -f /lib/firmware/mellanox/boot/default.bfb \
             || { echo "::error::default.bfb not found after installing mlxbf-bootimages"; exit 1; }
