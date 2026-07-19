@@ -1,0 +1,23 @@
+{
+  "dozenos-1x": "588de77a73ac8f9068a515917d5746c41b146bf5",
+  "dozenos-build": "42325de37cd1327930937ee6df75580f788b0060",
+  "dozenos-cloud-init": "6e246220638eb86763aa8076297d288f78ac00f2",
+  "dozenos-http-api-tools": "0e506ea849aee3fc5f636f7731225f4780a337c8",
+  "dozenos-rebrand": "68ad98e042de4b3846c3b62c58f3dc0141e39a89",
+  "dozenos-rebrand-arm64": "79f2cc731f1d575dc6cfed3463504b038dea8ee6",
+  "dozenos-vpp-patches": "6a4d1a0e35a60268e5619a7ea8d31f41f55665b5",
+  "dozenos1x-config": "5025cb17618336b9a543e77dbf08debb5581b29a",
+  "hvinfo": "7dddf034e58265025901833ba015be6aa60939f6",
+  "ipaddrcheck": "7c5f3543c20a45d6d71dfe9e0723fc822f017bd9",
+  "libnss-mapuser": "c8171773807248771bd45d934ca70248001086da",
+  "libnss-tacplus": "5363a7c2a1d506469f9000d96eef0795a2b27c8e",
+  "libpam-radius-auth": "d1725b621550fa64d9d5bea8adbcbaa648d412b6",
+  "libpam-tacplus": "fa1b4220911512b1b5a8e70406daea12c1dc6890",
+  "libtacplus-map": "6f78a3bd7ddafb06da192e21899ecb7e437cb4e8",
+  "live-boot": "69796a4be716ae9dde6c945306e208430b8adc6b",
+  "shim-signed": "8e89ce5eb111b7cbf31607ec7c5c2f755e6f9391",
+  "vyatta-bash": "206026ee8fac960dcd640d08e1ad14bb36d83916",
+  "vyatta-biosdevname": "ee6a795c5cf52ed4e6cc2ee2a76de31ce4a827ad",
+  "vyatta-cfg": "d3e1301ad35497a1ee52fa97494ab1036fb1106e",
+  "vyconf": "49444128096cbe3a21739d39be3afd8f7003e047"
+}
