@@ -1,0 +1,75 @@
+# arm64 build-container image workflow.
+#
+# The amd64 pipeline builds ghcr.io/dozenos/dozenos-build:rolling from a
+# workflow INSIDE the dozenos-build mirror (overlay new-files
+# build-docker-image.yml, push-triggered on docker/**). This repo cannot
+# receive that mirror's push events and must not touch the amd64 side, so
+# the arm64 image is built HERE, cross-repo, on a cron + manual dispatch.
+#
+# Own package name (dozenos-build-arm64:rolling, not
+# dozenos-build:rolling-arm64): pushing a new tag onto the amd64 repo's
+# existing GHCR package would need an org-admin package-access grant to
+# this repo; an own package needs none, keeps the amd64 package untouched,
+# and a wrong-name pull still fails loudly.
+name: Build DozenOS arm64 build-container image
+
+on:
+  schedule:
+    # Mondays 02:30 UTC -- ~3h before this repo's nightly cron
+    # ('17 5 * * 1') so a refreshed image is already pushed when the
+    # nightly pulls :rolling; clear of the mirrors' 03:17 self-sync.
+    - cron: '30 2 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-container-arm64
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Mint GitHub App token (dozenos-build checkout)
+        id: app_token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.BUILD_APP_ID }}
+          private-key: ${{ secrets.BUILD_APP_PRIVATE_KEY }}
+          owner: dozenos
+          repositories: dozenos-build
+
+      # The Dockerfile is the mirror's own docker/ -- this repo adds no
+      # container content, only the arm64 build+push of the same source.
+      - name: Checkout dozenos-build
+        uses: actions/checkout@v7
+        with:
+          repository: dozenos/dozenos-build
+          ref: rolling
+          token: ${{ steps.app_token.outputs.token }}
+          path: dozenos-build
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # ghcr.io only -- the job's own GITHUB_TOKEN (permissions.packages:
+      # write) suffices; the package links to this repo on first push.
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push dozenos-build-arm64 image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./dozenos-build/docker
+          file: ./dozenos-build/docker/Dockerfile
+          push: true
+          tags: ghcr.io/dozenos/dozenos-build-arm64:rolling
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

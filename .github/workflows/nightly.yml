@@ -1,0 +1,785 @@
+# DozenOS arm64 nightly BUILD + STORE workflow -- the arm64/BF2 sibling of
+# dozenos-nightly-build's nightly.yml (BF2-FLOWTABLE-OFFLOAD-PLAN.md §8).
+# Deliberately a COPY of that flow, not a shared reusable workflow: the
+# amd64 pipeline must stay untouched (user decision; copy-drift is the
+# documented cost, merge back into one reusable file later).
+#
+# arm64 deltas from the amd64 file:
+#   - every build job runs on GitHub native arm64 runners (ubuntu-24.04-arm)
+#     in the ghcr.io/dozenos/dozenos-build-arm64:rolling container (own
+#     package name: pushing a new tag onto the amd64 repo's dozenos-build
+#     package would need cross-repo GHCR grants; an own package needs none
+#     and a wrong-arch pull still fails loudly)
+#   - dozenos-rebrand-arm64 is checked out next to dozenos-build and its
+#     apply-patches.sh runs before any build (kernel config §6.1-6.3, OFED
+#     §6.4), followed by a CI-local throwaway commit so deb-cache.sh's
+#     HEAD:-based key material sees the patched recipe content
+#   - deb cache lives in dozenos/dozenos-deb-cache-arm64 (separate repo so
+#     the amd64 cache can never be poisoned by arm64 entries or vice versa)
+#   - kernel-config gate (plan §9.0): the linux-kernel leg fails minutes in
+#     if any BF2 offload/BlueField option is missing from the built kernel
+#   - flavors come from dozenos-rebrand-arm64/flavors/
+#   - Secure Boot / shim / MOK steps are absent (amd64-only; BF2 boots via
+#     NVIDIA ATF/UEFI, not shim)
+#   - no test-image job yet: the QEMU smoketest needs an arm64 test VM
+#     environment, wired in a later round (plan §8) -- publish gates only
+#     on every flavor building
+#
+# Helper scripts (specs in dozenos-rebrand/DISTRIBUTION.md, ISO-BUILD.md):
+#   dozenos-rebrand/release/make-ephemeral-apt-repo.sh -- ephemeral apt repo
+#   dozenos-rebrand/release/gen-version-json.sh        -- version.json
+#   dozenos-rebrand/release/sign-and-publish.sh        -- minisign + Release
+#
+# Secrets/vars (names authoritative in dozenos-rebrand/CI-SECRETS.md):
+#   vars.BUILD_APP_ID + secrets.BUILD_APP_PRIVATE_KEY -- org GitHub App;
+#     every cross-repo step mints a short-lived (~1h) installation token.
+#   secrets.MINISIGN_SECRET_KEY / MINISIGN_PASSWORD -- sign-and-publish.sh.
+#   secrets.GITHUB_TOKEN -- same-repo Release publish + commit-back.
+#   vars.BUILD_BY -- build-identity string (non-secret).
+#
+# No `uses: vyos/*` anywhere in this file (dozenos-rebrand/WORKFLOW-POLICY.md
+# hard rule).
+name: DozenOS arm64 nightly build
+
+on:
+  # No repository_dispatch: the mirrors' sync.yml dispatches image-build
+  # requests to the amd64 dozenos-nightly-build only. The weekly cron is
+  # this repo's build tick (arm64 runner quota; also picks up Debian
+  # archive drift). check-changes still dedupes an unchanged mirror set on
+  # any future dispatch sender.
+  schedule:
+    # Mondays 05:17 UTC -- ~1h after the amd64 nightly heartbeat
+    # ('17 4 * * 1') and well after the mirrors' 03:17 self-sync and this
+    # repo's 02:30 container refresh.
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      version_override:
+        description: 'Version string to build/tag instead of the computed "YYYY.MM.DD-HHMM-rolling". Leave blank for the normal auto-computed version.'
+        required: false
+        type: string
+
+concurrency:
+  group: dozenos-nightly-build-arm64
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # check-changes: build only when a dozenos/* mirror (or the rebrand
+  # toolkits) actually moved since the last published arm64 image. Same
+  # snapshot/baseline mechanism as the amd64 repo, against THIS repo's own
+  # mirror-state.json.
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.gate.outputs.changed }}
+      shas: ${{ steps.gate.outputs.shas }}
+    steps:
+      # `ref:` is load-bearing -- a run queued behind another must read the
+      # baseline at job-execution time, not from when the run was created.
+      - name: Checkout dozenos-nightly-build-arm64 (for the recorded baseline)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+
+      # Org-wide read: enumerating the mirror set needs every installation
+      # repo (CI-SECRETS.md §4).
+      - name: Mint GitHub App token (org-wide mirror snapshot)
+        id: app_token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.BUILD_APP_ID }}
+          private-key: ${{ secrets.BUILD_APP_PRIVATE_KEY }}
+          owner: dozenos
+
+      - name: Snapshot mirror HEADs and compare to last-built baseline
+        id: gate
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          # Every dozenos/* repo with a `rolling` branch == the mirror set.
+          # This repo and the amd64 nightly repo are skipped explicitly so
+          # neither repo's commit-backs can feed into the fingerprint.
+          declare -A shas
+          while read -r r; do
+            [ -n "$r" ] || continue
+            [ "$r" = "dozenos-nightly-build-arm64" ] && continue
+            [ "$r" = "dozenos-nightly-build" ] && continue
+            if sha=$(gh api "repos/dozenos/$r/commits/rolling" --jq '.sha' 2>/dev/null); then
+              [ -n "$sha" ] && shas["$r"]="$sha"
+            fi
+          done < <(gh api --paginate orgs/dozenos/repos --jq '.[].name' | sort -u)
+
+          # The two rebrand toolkits have no `rolling` branch -- track their
+          # default-branch HEADs; both alter the arm64 image as much as any
+          # package mirror.
+          for tk in dozenos-rebrand dozenos-rebrand-arm64; do
+            if tsha=$(gh api "repos/dozenos/$tk/commits/HEAD" --jq '.sha' 2>/dev/null); then
+              [ -n "$tsha" ] && shas["$tk"]="$tsha"
+            fi
+          done
+
+          current=$(for k in "${!shas[@]}"; do
+              printf '%s\t%s\n' "$k" "${shas[$k]}"
+            done | jq -R -s 'split("\n") | map(select(length>0) | split("\t"))
+              | map({(.[0]): .[1]}) | add // {}' | jq -Sc .)
+          echo "I: current mirror fingerprint ($(printf '%s' "$current" | jq 'length') repos): $current"
+
+          baseline='{}'
+          if [ -f mirror-state.json ]; then
+            baseline=$(jq -Sc . mirror-state.json)
+          fi
+
+          echo "shas=$current" >> "$GITHUB_OUTPUT"
+
+          # workflow_dispatch = "build now"; schedule = the weekly tick that
+          # must build even unchanged (Debian archive drift is invisible to
+          # the mirror-SHA gate).
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "I: ${{ github.event_name }} -- forcing a build regardless of the gate."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$current" = "$baseline" ]; then
+            echo "I: mirror fingerprint unchanged since the last published image -- skipping this build."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "I: mirror change detected -- building. Diff (baseline vs current):"
+            diff <(printf '%s' "$baseline" | jq -r 'to_entries[] | "\(.key) \(.value)"' | sort) \
+                 <(printf '%s' "$current"  | jq -r 'to_entries[] | "\(.key) \(.value)"' | sort) || true
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # set-version: one VERSION string shared by every later job.
+  set-version:
+    needs: check-changes
+    if: needs.check-changes.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - name: Compute nightly version string
+        id: v
+        env:
+          # Via env, never ${{ }}-interpolated into the script body: a
+          # dispatch input must not be able to inject shell here.
+          VERSION_OVERRIDE: ${{ inputs.version_override }}
+        run: |
+          set -euo pipefail
+          if [ -n "$VERSION_OVERRIDE" ]; then
+            VERSION="$VERSION_OVERRIDE"
+            echo "I: using dispatch override version: $VERSION"
+          else
+            VERSION="$(date -u +%Y.%m.%d-%H%M)-rolling"
+            echo "I: computed version: $VERSION"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  # discover: the FULL package list (a release needs every package, not a
+  # diff). Exclusions carried over from the amd64 file with the same
+  # rationale:
+  #   shim-signed  -- Secure Boot shim, never rebuilt (SB-SIGNING.md);
+  #                   doubly moot on arm64 (no shim boot path at all).
+  #   unionfs-fuse -- the 3.6 recipe shadows Debian's stock package and
+  #                   breaks every config commit (see amd64 nightly.yml).
+  #   vpp          -- built inside the linux-kernel leg by
+  #                   build-accel-ppp-ng.sh; a second leg builds a
+  #                   near-duplicate .deb set that sinks the apt-repo
+  #                   stanza==deb-count guard.
+  # x86-only OOT drivers (intel-nic, intel-qat) self-skip inside the
+  # linux-kernel leg via their own dpkg-architecture guards. Any C2 package
+  # that turns out not to build on arm64 gets excluded here explicitly in a
+  # follow-up round -- fail loudly first, don't pre-trim silently.
+  discover:
+    needs: check-changes
+    if: needs.check-changes.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      packages: ${{ steps.set.outputs.packages }}
+    steps:
+      - name: Mint GitHub App token (dozenos-build checkout)
+        id: app_token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.BUILD_APP_ID }}
+          private-key: ${{ secrets.BUILD_APP_PRIVATE_KEY }}
+          owner: dozenos
+          repositories: dozenos-build
+
+      - name: Checkout dozenos-build
+        uses: actions/checkout@v7
+        with:
+          repository: dozenos/dozenos-build
+          ref: rolling
+          token: ${{ steps.app_token.outputs.token }}
+          path: dozenos-build
+
+      - name: List every C2 package (full nightly rebuild, not a diff)
+        id: set
+        working-directory: dozenos-build
+        run: |
+          set -euo pipefail
+          others=$(find scripts/package-build -mindepth 1 -maxdepth 1 -type d \
+            ! -name linux-kernel ! -name shim-signed ! -name vpp \
+            ! -name unionfs-fuse -printf '%f\n' | sort)
+          packages=$(printf '%s\nlinux-kernel\n' "$others" | jq -R . | jq -sc .)
+          echo "packages=$packages" >> "$GITHUB_OUTPUT"
+          echo "I: full nightly package matrix (vpp built inside linux-kernel): $packages"
+
+  # build-packages: native arm64 runners; same build-step shape as the
+  # amd64 file plus the arm64 patch layer and the kernel-config gate.
+  build-packages:
+    needs: discover
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg: ${{ fromJson(needs.discover.outputs.packages) }}
+    steps:
+      - name: Mint GitHub App token (build + rebrand checkouts)
+        id: app_token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.BUILD_APP_ID }}
+          private-key: ${{ secrets.BUILD_APP_PRIVATE_KEY }}
+          owner: dozenos
+          repositories: dozenos-build,dozenos-rebrand,dozenos-rebrand-arm64
+
+      - name: Checkout dozenos-build
+        uses: actions/checkout@v7
+        with:
+          repository: dozenos/dozenos-build
+          ref: rolling
+          token: ${{ steps.app_token.outputs.token }}
+          path: dozenos-build
+
+      - name: Checkout dozenos-rebrand
+        uses: actions/checkout@v7
+        with:
+          repository: dozenos/dozenos-rebrand
+          token: ${{ steps.app_token.outputs.token }}
+          path: dozenos-rebrand
+
+      - name: Checkout dozenos-rebrand-arm64
+        uses: actions/checkout@v7
+        with:
+          repository: dozenos/dozenos-rebrand-arm64
+          token: ${{ steps.app_token.outputs.token }}
+          path: dozenos-rebrand-arm64
+
+      # The throwaway commit is load-bearing: deb-cache.sh derives key
+      # material from `git rev-parse HEAD:<path>`, so uncommitted patch
+      # edits would be invisible to the cache key (stale-cache hazard) --
+      # and only the recipes a patch actually touches get new keys. The
+      # commit exists solely inside this job's workspace, never pushed.
+      - name: Apply arm64/DPU patches
+        run: |
+          set -euo pipefail
+          dozenos-rebrand-arm64/apply-patches.sh dozenos-build
+          git -C dozenos-build add -A
+          git -C dozenos-build -c user.name="DozenOS autobuild" \
+            -c user.email="autobuild@dozenos.local" \
+            commit -qm "apply arm64 patches (CI-local, never pushed)"
+
+      # deb-cache (dozenos-rebrand/DEB-CACHE.md), against the arm64-only
+      # cache repo. Every failure mode degrades to a full rebuild, never to
+      # a wrong image.
+      - name: Compute deb-cache key
+        id: cachekey
+        run: |
+          set -euo pipefail
+          if KEY=$(dozenos-rebrand/release/deb-cache.sh key \
+                --unit "${{ matrix.pkg }}" \
+                --build dozenos-build \
+                --rebrand dozenos-rebrand \
+                --manifest "$RUNNER_TEMP/deb-cache-manifest.json"); then
+            echo "I: deb-cache key for ${{ matrix.pkg }}: $KEY"
+            echo "key=$KEY" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::deb-cache key computation failed for ${{ matrix.pkg }} -- building without cache (fail-safe)"
+            echo "key=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Probe deb cache
+        id: probe
+        if: steps.cachekey.outputs.key != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if dozenos-rebrand/release/deb-cache.sh probe \
+              --unit "${{ matrix.pkg }}" \
+              --key "${{ steps.cachekey.outputs.key }}" \
+              --repo dozenos/dozenos-deb-cache-arm64 \
+              --dest "dozenos-build/scripts/package-build/${{ matrix.pkg }}"; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build ${{ matrix.pkg }}
+        if: steps.probe.outputs.hit != 'true'
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.pkg }}" = "linux-kernel" ]; then
+            # One build.py invocation, no --packages filter: kernel plus
+            # every OOT module block (x86-only ones self-skip via their
+            # dpkg-architecture guards).
+            docker run --rm \
+              -v "${{ github.workspace }}/dozenos-build:/dozenos" \
+              -w /dozenos \
+              ghcr.io/dozenos/dozenos-build-arm64:rolling \
+              bash -c "cd scripts/package-build/linux-kernel && python3 build.py"
+          else
+            docker run --rm \
+              -v "${{ github.workspace }}/dozenos-build:/dozenos" \
+              -w /dozenos \
+              ghcr.io/dozenos/dozenos-build-arm64:rolling \
+              bash -c "cd scripts/package-build/${{ matrix.pkg }} && python3 ../build.py"
+          fi
+
+      # Plan §9.0: fail the run minutes in -- not after a full image build
+      # and a BF2 flash cycle -- if a BF2 offload/BlueField option ever
+      # regresses out of the built kernel. The option list is derived from
+      # the patch script itself (every enable_opt/add_opt line), so the
+      # gate can never drift behind the patch: an add_opt option whose
+      # kconfig dependency silently un-resolves (alldefconfig drops it
+      # with only a warning) fails HERE. Runs on the cache-hit path too:
+      # the gate is cheap and also guards a corrupted cache entry.
+      - name: Kernel-config gate (BF2 offload options present)
+        id: kgate
+        if: matrix.pkg == 'linux-kernel'
+        run: |
+          set -euo pipefail
+          deb=$(find dozenos-build/scripts/package-build/linux-kernel \
+                  -maxdepth 1 -name 'linux-image-*_arm64.deb' ! -name '*dbg*' | head -1)
+          [ -n "$deb" ] || { echo "::error::no linux-image .deb found for the config gate"; exit 1; }
+          rm -rf kcheck && mkdir kcheck
+          dpkg-deb -x "$deb" kcheck
+          opts=$(grep -E '^(enable_opt|add_opt) ' \
+                   dozenos-rebrand-arm64/patches/kernel-config-bf2-offload.sh \
+                 | awk '{print $3}')
+          [ -n "$opts" ] || { echo "::error::could not derive the option list from kernel-config-bf2-offload.sh"; exit 1; }
+          for opt in $opts; do
+            grep -qE "^CONFIG_${opt}=[ym]" kcheck/boot/config-* \
+              || { echo "::error::CONFIG_${opt} missing in built kernel config"; exit 1; }
+          done
+          rm -rf kcheck
+          echo "I: all $(echo "$opts" | wc -w) BF2 offload/BlueField options present in the built kernel"
+
+      # A poisoned CACHED kernel entry would otherwise wedge every future
+      # nightly: the key is deterministic, so the same bad entry re-hits
+      # until someone deletes it by hand. Evict it so the next run
+      # rebuilds; this run still fails loudly via the gate above.
+      - name: Mint GitHub App token (evict poisoned cache entry)
+        id: evict_token
+        if: failure() && steps.kgate.outcome == 'failure' && steps.probe.outputs.hit == 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.BUILD_APP_ID }}
+          private-key: ${{ secrets.BUILD_APP_PRIVATE_KEY }}
+          owner: dozenos
+          repositories: dozenos-deb-cache-arm64
+
+      - name: Evict poisoned cache entry
+        if: failure() && steps.evict_token.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.evict_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ matrix.pkg }}-$(printf '%s' "${{ steps.cachekey.outputs.key }}" | cut -c1-12)"
+          echo "I: evicting poisoned deb-cache entry $tag"
+          gh release delete "$tag" --repo dozenos/dozenos-deb-cache-arm64 \
+            --yes --cleanup-tag \
+            || echo "::warning::could not evict $tag -- delete it by hand before the next run"
+
+      # Minted AFTER the (possibly multi-hour) build step: an App token
+      # lives ~1h. continue-on-error: a cache write failure must never fail
+      # the nightly.
+      - name: Mint GitHub App token (deb-cache store)
+        id: cache_token
+        if: steps.cachekey.outputs.key != '' && steps.probe.outputs.hit != 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.BUILD_APP_ID }}
+          private-key: ${{ secrets.BUILD_APP_PRIVATE_KEY }}
+          owner: dozenos
+          repositories: dozenos-deb-cache-arm64
+
+      - name: Store built debs into deb cache
+        if: steps.cache_token.outcome == 'success' && steps.cachekey.outputs.key != '' && steps.probe.outputs.hit != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.cache_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          dozenos-rebrand/release/deb-cache.sh store \
+            --unit "${{ matrix.pkg }}" \
+            --key "${{ steps.cachekey.outputs.key }}" \
+            --repo dozenos/dozenos-deb-cache-arm64 \
+            --debs "dozenos-build/scripts/package-build/${{ matrix.pkg }}" \
+            --manifest "$RUNNER_TEMP/deb-cache-manifest.json"
+
+      - name: Upload built package(s)
+        uses: actions/upload-artifact@v7
+        with:
+          name: deb-${{ matrix.pkg }}
+          path: dozenos-build/scripts/package-build/${{ matrix.pkg }}/*.deb
+          # error, not warn: a leg that "succeeds" with zero .debs must fail
+          # the nightly loudly, not silently thin out the image's apt pool.
+          if-no-files-found: error
+          retention-days: 1
+
+  # discover-flavors: enumerate flavors from dozenos-rebrand-arm64's
+  # flavors/<subdir>/<flavor>.toml tree. Dropping a new toml into that repo
+  # adds a build-image matrix leg with no workflow change.
+  discover-flavors:
+    needs: check-changes
+    if: needs.check-changes.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - name: Mint GitHub App token (dozenos-rebrand-arm64 checkout)
+        id: app_token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.BUILD_APP_ID }}
+          private-key: ${{ secrets.BUILD_APP_PRIVATE_KEY }}
+          owner: dozenos
+          repositories: dozenos-rebrand-arm64
+
+      - name: Checkout dozenos-rebrand-arm64
+        uses: actions/checkout@v7
+        with:
+          repository: dozenos/dozenos-rebrand-arm64
+          token: ${{ steps.app_token.outputs.token }}
+          path: dozenos-rebrand-arm64
+
+      - name: Build flavor matrix from flavors/*/*.toml
+        id: m
+        run: |
+          set -euo pipefail
+          matrix=$(
+            cd dozenos-rebrand-arm64/flavors
+            shopt -s nullglob
+            for f in */*.toml; do
+              subdir="${f%%/*}"
+              flavor="$(basename "$f" .toml)"
+              printf '{"flavor":"%s","subdir":"%s"}\n' "$flavor" "$subdir"
+            done | jq -sc .
+          )
+          if [ "$matrix" = "[]" ] || [ -z "$matrix" ]; then
+            echo "::error::no flavor tomls found under dozenos-rebrand-arm64/flavors/*/" >&2
+            exit 1
+          fi
+          echo "I: flavor matrix: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  # build-image: one matrix leg per (flavor, subdir), native arm64. Same
+  # ephemeral localhost-HTTP apt repo mechanism as amd64 (do NOT revisit
+  # file:// -- see the amd64 file's history note).
+  build-image:
+    needs: [check-changes, set-version, build-packages, discover-flavors]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.discover-flavors.outputs.matrix) }}
+    env:
+      VERSION: ${{ needs.set-version.outputs.version }}
+      DEBIAN_MIRROR: http://deb.debian.org/debian/
+      DEBIAN_SECURITY_MIRROR: http://deb.debian.org/debian-security
+    steps:
+      - name: Mint GitHub App token (build + rebrand checkouts)
+        id: app_token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.BUILD_APP_ID }}
+          private-key: ${{ secrets.BUILD_APP_PRIVATE_KEY }}
+          owner: dozenos
+          repositories: dozenos-build,dozenos-rebrand,dozenos-rebrand-arm64
+
+      - name: Checkout dozenos-build
+        uses: actions/checkout@v7
+        with:
+          repository: dozenos/dozenos-build
+          ref: rolling
+          token: ${{ steps.app_token.outputs.token }}
+          path: dozenos-build
+
+      - name: Checkout dozenos-rebrand
+        uses: actions/checkout@v7
+        with:
+          repository: dozenos/dozenos-rebrand
+          token: ${{ steps.app_token.outputs.token }}
+          path: dozenos-rebrand
+
+      - name: Checkout dozenos-rebrand-arm64
+        uses: actions/checkout@v7
+        with:
+          repository: dozenos/dozenos-rebrand-arm64
+          token: ${{ steps.app_token.outputs.token }}
+          path: dozenos-rebrand-arm64
+
+      # Same patch layer as build-packages: today it only touches the
+      # linux-kernel recipe, but applying uniformly keeps this job correct
+      # the day a patch touches image-build inputs. No commit needed here
+      # (no deb-cache key in this job).
+      - name: Apply arm64/DPU patches
+        run: dozenos-rebrand-arm64/apply-patches.sh dozenos-build
+
+      - name: Download all built .deb artifacts from this run
+        uses: actions/download-artifact@v8
+        with:
+          pattern: 'deb-*'
+          path: dozenos-debs
+          merge-multiple: true
+
+      - name: Build DozenOS ${{ matrix.flavor }} image (${{ matrix.subdir }}, arm64)
+        run: |
+          docker run --rm \
+            --sysctl net.ipv6.conf.lo.disable_ipv6=0 --privileged \
+            -v "${{ github.workspace }}/dozenos-build:/dozenos" \
+            -v "${{ github.workspace }}/dozenos-rebrand:/dozenos-rebrand" \
+            -v "${{ github.workspace }}/dozenos-rebrand-arm64:/dozenos-rebrand-arm64" \
+            -v "${{ github.workspace }}/dozenos-debs:/dozenos-debs:ro" \
+            -w /dozenos \
+            -e BUILD_BY="${{ vars.BUILD_BY }}" \
+            -e DEBIAN_MIRROR="${{ env.DEBIAN_MIRROR }}" \
+            -e DEBIAN_SECURITY_MIRROR="${{ env.DEBIAN_SECURITY_MIRROR }}" \
+            -e VERSION="${{ env.VERSION }}" \
+            -e BUILD_FLAVOR="${{ matrix.flavor }}" \
+            -e DOZENOS_BUILD_FLAVORS_DIR="/dozenos-rebrand-arm64/flavors/${{ matrix.subdir }}" \
+            ghcr.io/dozenos/dozenos-build-arm64:rolling \
+            bash -c '
+              set -euo pipefail
+              DOZENOS_MIRROR=""
+              if [ -n "$(find /dozenos-debs -name "*.deb" -print -quit 2>/dev/null)" ]; then
+                /dozenos-rebrand/release/make-ephemeral-apt-repo.sh /dozenos-debs /tmp/dozenos-apt-repo >/dev/null
+                # localhost HTTP, not file:// -- chroot apt cannot see the
+                # container-side /tmp path but does share the network
+                # namespace. (Comments in this single-quoted block must
+                # stay apostrophe-free.)
+                (cd /tmp/dozenos-apt-repo && exec python3 -m http.server --bind 127.0.0.1 8099 >/tmp/dozenos-apt-http.log 2>&1) &
+                for i in $(seq 1 50); do
+                  curl -fsS -o /dev/null http://127.0.0.1:8099/dists/rolling/Release && break
+                  sleep 0.2
+                done
+                curl -fsS -o /dev/null http://127.0.0.1:8099/dists/rolling/Release || { echo "E: ephemeral apt repo HTTP server did not come up"; exit 1; }
+                DOZENOS_MIRROR="[trusted=yes] http://127.0.0.1:8099"
+                echo "I: ephemeral DozenOS apt repo built + served"
+              else
+                echo "W: no .deb files found under /dozenos-debs -- building with an empty --dozenos-mirror anyway rather than failing the whole nightly"
+              fi
+              sudo --preserve-env ./build-dozenos-image \
+                --architecture arm64 \
+                --build-by "$BUILD_BY" \
+                --debian-mirror "$DEBIAN_MIRROR" \
+                --debian-security-mirror "$DEBIAN_SECURITY_MIRROR" \
+                --version "$VERSION" \
+                --dozenos-mirror "$DOZENOS_MIRROR" \
+                "$BUILD_FLAVOR"
+            '
+
+      # build-dozenos-image ran under sudo inside the container -- reclaim
+      # ownership so later steps can write next to the artifacts.
+      - name: Reclaim ownership of build artifacts
+        run: sudo chown -R "$(id -u):$(id -g)" dozenos-build/build
+
+      # manifest.json's "artifacts" is exactly the flavor toml's declared
+      # image_format list; meta.json carries the flavor/subdir to publish.
+      - name: Collect manifest-declared artifacts
+        run: |
+          set -euo pipefail
+          python3 - "${{ matrix.flavor }}" "${{ matrix.subdir }}" <<'PYEOF'
+          import json, shutil, sys, os
+          flavor, subdir = sys.argv[1], sys.argv[2]
+          m = json.load(open('dozenos-build/build/manifest.json'))
+          arts = m.get('artifacts') or []
+          if not arts:
+              print('::error::manifest.json lists no artifacts', file=sys.stderr)
+              sys.exit(1)
+          os.makedirs('image-out', exist_ok=True)
+          for a in arts:
+              src = os.path.join('dozenos-build/build', a)
+              if not os.path.isfile(src):
+                  print(f'::error::manifest artifact missing on disk: {src}', file=sys.stderr)
+                  sys.exit(1)
+              shutil.copy(src, 'image-out/')
+              print(f'I: collected {a}')
+          with open('image-out/meta.json', 'w') as f:
+              json.dump({'flavor': flavor, 'subdir': subdir, 'artifacts': arts}, f)
+          PYEOF
+
+      - name: Upload image artifacts for the publish job
+        uses: actions/upload-artifact@v7
+        with:
+          name: image-${{ matrix.subdir }}-${{ matrix.flavor }}
+          path: image-out/
+          retention-days: 3
+          if-no-files-found: error
+
+  # publish: minisign every artifact, one GitHub Release, commit
+  # version.json + mirror-state.json back as the change-gate baseline.
+  # NOTE (deliberate, round 1): no test-image gate yet -- the QEMU
+  # smoketest matrix needs an arm64 test environment (plan §8, later
+  # round). The baseline only advances when EVERY flavor built.
+  publish:
+    needs: [check-changes, set-version, build-image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.set-version.outputs.version }}
+    steps:
+      - name: Checkout dozenos-nightly-build-arm64 (this repo)
+        uses: actions/checkout@v7
+        with:
+          path: nightly-build
+
+      - name: Mint GitHub App token (dozenos-rebrand checkout)
+        id: app_token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.BUILD_APP_ID }}
+          private-key: ${{ secrets.BUILD_APP_PRIVATE_KEY }}
+          owner: dozenos
+          repositories: dozenos-rebrand
+
+      - name: Checkout dozenos-rebrand
+        uses: actions/checkout@v7
+        with:
+          repository: dozenos/dozenos-rebrand
+          token: ${{ steps.app_token.outputs.token }}
+          path: dozenos-rebrand
+
+      # NO merge-multiple: two subdirs may legitimately ship the SAME
+      # flavor name; per-leg directories turn a cross-leg filename
+      # collision into a loud release-upload error.
+      - name: Download all image artifacts from this run
+        uses: actions/download-artifact@v8
+        with:
+          pattern: 'image-*'
+          path: images
+
+      - name: Install minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+      - name: Generate version.json, sign all artifacts, publish Release
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          gen_args=()
+          pub_args=()
+          for meta in images/*/meta.json; do
+            dir=$(dirname "$meta")
+            flavor=$(jq -r .flavor "$meta")
+            subdir=$(jq -r .subdir "$meta")
+            while IFS= read -r name; do
+              path="$dir/$name"
+              if [ ! -f "$path" ]; then
+                echo "::error::artifact '$name' from $meta missing on disk" >&2
+                exit 1
+              fi
+              gen_args+=(--artifact "$flavor:$subdir:$path")
+              pub_args+=(--asset "$path")
+            done < <(jq -r '.artifacts[]' "$meta")
+          done
+          if [ "${#pub_args[@]}" -eq 0 ]; then
+            echo "::error::no image artifacts found under images/ -- nothing to publish" >&2
+            exit 1
+          fi
+          dozenos-rebrand/release/gen-version-json.sh \
+            --version "$VERSION" \
+            "${gen_args[@]}" \
+            --release-url "https://github.com/dozenos/dozenos-nightly-build-arm64/releases/download/${VERSION}" \
+            --out nightly-build/version.json
+          dozenos-rebrand/release/sign-and-publish.sh \
+            "${pub_args[@]}" \
+            --version-json nightly-build/version.json \
+            --tag "$VERSION" \
+            --repo dozenos/dozenos-nightly-build-arm64 \
+            --title "DozenOS arm64 nightly $VERSION"
+
+      - name: Commit version.json + mirror-state.json to default branch
+        working-directory: nightly-build
+        env:
+          # The fingerprint check-changes OBSERVED at run start -- a mirror
+          # that synced mid-build stays unrecorded so the next tick
+          # rebuilds for it.
+          MIRROR_SHAS: ${{ needs.check-changes.outputs.shas }}
+        run: |
+          set -euo pipefail
+          git config user.name "DozenOS autobuild"
+          git config user.email "autobuild@dozenos.local"
+          cp version.json "$RUNNER_TEMP/version.json"
+          # Retry loop against a moved remote; both files are whole-file
+          # regenerated from this run's own data, nothing is merged.
+          for attempt in 1 2 3; do
+            git fetch origin "${{ github.ref_name }}"
+            git reset --hard "origin/${{ github.ref_name }}"
+            cp "$RUNNER_TEMP/version.json" version.json
+            printf '%s\n' "$MIRROR_SHAS" | jq -S . > mirror-state.json
+            git add version.json mirror-state.json
+            if git diff --cached --quiet; then
+              echo "I: version.json + mirror-state.json unchanged, nothing to commit"
+              exit 0
+            fi
+            git commit -m "chore: update version.json + mirror-state.json for ${VERSION}"
+            if git push origin "HEAD:${{ github.ref_name }}"; then
+              echo "I: commit-back pushed (attempt $attempt)"
+              exit 0
+            fi
+            echo "W: push rejected (remote moved during run?) -- re-syncing and retrying ($attempt/3)"
+          done
+          echo "::error::commit-back failed after 3 attempts -- version.json/mirror-state.json on ${{ github.ref_name }} are stale (the Release itself already published fine)" >&2
+          exit 1
+
+  # prune-deb-cache: keep the newest 3 entries per unit on the arm64 cache
+  # repo. Pruning must never fail a nightly -- continue-on-error on every
+  # step.
+  prune-deb-cache:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint GitHub App token (deb-cache prune)
+        id: cache_token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.BUILD_APP_ID }}
+          private-key: ${{ secrets.BUILD_APP_PRIVATE_KEY }}
+          owner: dozenos
+          repositories: dozenos-rebrand,dozenos-deb-cache-arm64
+
+      - name: Checkout dozenos-rebrand
+        if: steps.cache_token.outcome == 'success'
+        continue-on-error: true
+        uses: actions/checkout@v7
+        with:
+          repository: dozenos/dozenos-rebrand
+          token: ${{ steps.cache_token.outputs.token }}
+          path: dozenos-rebrand
+
+      - name: Prune deb cache (keep newest 3 per unit)
+        if: steps.cache_token.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.cache_token.outputs.token }}
+        run: |
+          dozenos-rebrand/release/deb-cache.sh prune --keep 3 \
+            --repo dozenos/dozenos-deb-cache-arm64

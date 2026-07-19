@@ -1,0 +1,33 @@
+name: Prune rolling releases
+
+on:
+  workflow_run:
+    workflows: ["DozenOS arm64 nightly build"]
+    types: [completed]
+  workflow_dispatch:
+
+jobs:
+  # Keep the newest 15 *-rolling releases, delete older ones with their
+  # tags. "Newest" is judged by release id -- created_at is the tagged
+  # commit's date, not the publish time, so it cannot order releases.
+  # Non-rolling tags are exempt.
+  prune:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Prune rolling releases (keep newest 15)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/${{ github.repository }}/releases" \
+            --jq '.[] | "\(.id)\t\(.tag_name)"' \
+            | sort -k1,1 -rn | cut -f2 | { grep -- '-rolling$' || true; } \
+            | tail -n +16 | while IFS= read -r tag; do
+                echo "I: pruning release $tag"
+                gh release delete "$tag" --repo "${{ github.repository }}" \
+                  --yes --cleanup-tag \
+                  || echo "::warning::failed to delete release $tag (continuing)"
+              done
