@@ -687,10 +687,15 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
           gen_args=()
           pub_args=()
-          for meta in images/*/meta.json; do
+          # find, not an images/*/meta.json glob: download-artifact@v8 nests
+          # each artifact under images/<name>/ when several match, but flattens
+          # a SINGLE matched artifact straight into images/. arm64 ships one
+          # image flavor today, so meta.json can sit at either depth -- find
+          # handles both. (amd64's multi-flavor run always nests; this stays
+          # correct there too.)
+          while IFS= read -r meta; do
             dir=$(dirname "$meta")
             flavor=$(jq -r .flavor "$meta")
             subdir=$(jq -r .subdir "$meta")
@@ -703,7 +708,7 @@ jobs:
               gen_args+=(--artifact "$flavor:$subdir:$path")
               pub_args+=(--asset "$path")
             done < <(jq -r '.artifacts[]' "$meta")
-          done
+          done < <(find images -name meta.json)
           if [ "${#pub_args[@]}" -eq 0 ]; then
             echo "::error::no image artifacts found under images/ -- nothing to publish" >&2
             exit 1
