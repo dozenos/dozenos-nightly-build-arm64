@@ -562,7 +562,12 @@ jobs:
               set -euo pipefail
               DOZENOS_MIRROR=""
               if [ -n "$(find /dozenos-debs -name "*.deb" -print -quit 2>/dev/null)" ]; then
-                /dozenos-rebrand/release/make-ephemeral-apt-repo.sh /dozenos-debs /tmp/dozenos-apt-repo >/dev/null
+                # --arch arm64: the helper defaults to amd64, which makes
+                # dpkg-scanpackages drop every arm64 deb (keeping only
+                # Architecture: all) and write the index under binary-amd64/
+                # -- the wrong path for this chroot apt. arm64 needs both the
+                # right filter and the right binary-<arch>/ dir.
+                /dozenos-rebrand/release/make-ephemeral-apt-repo.sh /dozenos-debs /tmp/dozenos-apt-repo --arch arm64 >/dev/null
                 # localhost HTTP, not file:// -- chroot apt cannot see the
                 # container-side /tmp path but does share the network
                 # namespace. (Comments in this single-quoted block must
