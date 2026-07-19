@@ -1,0 +1,154 @@
+# Wrap a published DPU disk image into a BlueField-2 .bfb (plan §7).
+#
+# Separate, on-demand workflow_dispatch (NOT part of the scheduled nightly):
+# the .bfb can only be boot-validated on real BF2 hardware, so it is produced
+# deliberately, not on every nightly. The ASSEMBLY, however, runs and is
+# checkable in CI (does mlx-mkbfb emit a .bfb from our disk image + NVIDIA
+# boot images?).
+#
+# mlxbf-bootimages are per BlueField GENERATION (BF2), not per board -- one
+# package serves every BF2 card (NVIDIA ships one BFB per platform per DOCA
+# release). So doca_repo just pins a recent BF2 boot-image set; there is no
+# board-specific input.
+#
+# What it does: pull the DPU qcow2 from a nightly Release -> extract the
+# kernel Image + modules from it -> build the dd-installer initramfs
+# (dozenos-rebrand-arm64/bfb/create-installer-initramfs.sh) -> pack with
+# NVIDIA default.bfb via mlx-mkbfb (bfb/make-bfb.sh) -> upload the .bfb to the
+# same Release.
+name: Build BF2 BFB
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag whose dpu qcow2 to wrap (blank = latest).'
+        required: false
+        type: string
+      doca_repo:
+        description: 'NVIDIA DOCA apt source line providing mlxbf-bootimages (aarch64).'
+        required: true
+        default: 'deb [trusted=yes] https://linux.mellanox.com/public/repo/doca/latest/debian12.5/aarch64/ ./'
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-bfb
+  cancel-in-progress: false
+
+jobs:
+  build-bfb:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Checkout dozenos-rebrand-arm64 (bfb/ scripts)
+        uses: actions/checkout@v7
+        with:
+          repository: dozenos/dozenos-rebrand-arm64
+          path: rebrand-arm64
+
+      - name: Install host tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y qemu-utils zstd busybox-static cpio gzip \
+            gdisk kpartx ca-certificates wget
+
+      # mlxbf-bootimages provides /lib/firmware/mellanox/boot/default.bfb (+
+      # capsule) and /opt/mellanox/scripts/bin/mlx-mkbfb. The DOCA repo is
+      # public; [trusted=yes] in the source line avoids a key dance for a
+      # first bring-up (tighten to Signed-By once the exact keyring is pinned).
+      - name: Install NVIDIA mlxbf-bootimages + mlx-mkbfb (DOCA repo)
+        run: |
+          set -euo pipefail
+          echo "${{ inputs.doca_repo }}" | sudo tee /etc/apt/sources.list.d/doca.list
+          sudo apt-get update
+          sudo apt-get install -y mlxbf-bootimages
+          test -f /lib/firmware/mellanox/boot/default.bfb \
+            || { echo "::error::default.bfb not found after installing mlxbf-bootimages"; exit 1; }
+          MKBFB=$(command -v mlx-mkbfb || echo /opt/mellanox/scripts/bin/mlx-mkbfb)
+          test -x "$MKBFB" || { echo "::error::mlx-mkbfb not found (adjust the DOCA package set)"; exit 1; }
+          echo "MKBFB=$MKBFB" >> "$GITHUB_ENV"
+
+      - name: Download the DPU qcow2 from the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.release_tag }}"
+          [ -n "$TAG" ] || TAG=$(gh release list -R "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
+          echo "I: wrapping release $TAG"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          gh release download "$TAG" -R "${{ github.repository }}" \
+            --pattern '*-dpu-arm64.qcow2' --dir .
+          qcow=$(ls ./*-dpu-arm64.qcow2)
+          echo "QCOW=$qcow" >> "$GITHUB_ENV"
+
+      # Pull the kernel Image + /lib/modules out of the disk image: connect the
+      # qcow2 via qemu-nbd, mount the root partition, then the VyOS live
+      # squashfs it carries, and copy vmlinuz + modules for the installer
+      # initramfs.
+      - name: Extract kernel Image + modules from the qcow2
+        run: |
+          set -euo pipefail
+          sudo modprobe nbd max_part=16
+          sudo qemu-nbd --connect=/dev/nbd0 "$QCOW"
+          sudo partprobe /dev/nbd0 || true
+          sleep 2
+          mkdir -p mnt
+          # root partition is the largest; try p2 then p1.
+          root=/dev/nbd0p2; [ -b "$root" ] || root=/dev/nbd0p1
+          sudo mount "$root" mnt
+          # VyOS layout: boot/<version>/ holds vmlinuz + the *.squashfs image.
+          KVER=""
+          for d in mnt/boot/*/; do
+            b=$(basename "$d")
+            [ "$b" = "efi" ] && continue
+            [ -f "$d/vmlinuz" ] && { KVER="$b"; break; }
+          done
+          [ -n "$KVER" ] || { echo "::error::no boot/<version>/vmlinuz found in the image"; exit 1; }
+          echo "I: detected kernel version dir: $KVER"
+          sudo cp "mnt/boot/$KVER/vmlinuz" ./vmlinuz
+          sq=""
+          for f in mnt/boot/"$KVER"/*.squashfs; do [ -f "$f" ] && { sq="$f"; break; }; done
+          [ -n "$sq" ] || { echo "::error::no squashfs found under boot/$KVER"; exit 1; }
+          mkdir -p sq
+          sudo mount -o loop "$sq" sq
+          sudo cp -a "sq/lib/modules/$KVER" ./modules-"$KVER"
+          sudo umount sq && sudo umount mnt
+          sudo qemu-nbd --disconnect /dev/nbd0
+          echo "KVER=$KVER" >> "$GITHUB_ENV"
+
+      - name: Build installer initramfs (dd model)
+        run: |
+          set -euo pipefail
+          sudo rebrand-arm64/bfb/create-installer-initramfs.sh \
+            --disk "$QCOW" \
+            --busybox /usr/bin/busybox \
+            --modules-dir "./modules-$KVER" \
+            --kver "$KVER" \
+            --out installer.cpio.gz
+
+      - name: Pack the BFB
+        run: |
+          set -euo pipefail
+          cap=/lib/firmware/mellanox/boot/capsule/boot_update2.cap
+          caparg=""; [ -f "$cap" ] && caparg="--capsule $cap"
+          rebrand-arm64/bfb/make-bfb.sh \
+            --mkbfb "$MKBFB" \
+            --base-bfb /lib/firmware/mellanox/boot/default.bfb \
+            --kernel ./vmlinuz \
+            --initramfs installer.cpio.gz \
+            $caparg \
+            --out "dozenos-${TAG}-bf2.bfb"
+
+      - name: Upload the .bfb to the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" -R "${{ github.repository }}" \
+            "dozenos-${TAG}-bf2.bfb" --clobber
+          echo "I: uploaded dozenos-${TAG}-bf2.bfb to release $TAG"
