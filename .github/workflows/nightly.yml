@@ -358,7 +358,7 @@ jobs:
           [ -n "$deb" ] || { echo "::error::no linux-image .deb found for the config gate"; exit 1; }
           rm -rf kcheck && mkdir kcheck
           dpkg-deb -x "$deb" kcheck
-          opts=$(grep -E '^(enable_opt|add_opt) ' \
+          opts=$(grep -E '^(enable_opt|add_opt|force_opt) ' \
                    dozenos-rebrand-arm64/patches/kernel-config-bf2-offload.sh \
                  | awk '{print $3}')
           [ -n "$opts" ] || { echo "::error::could not derive the option list from kernel-config-bf2-offload.sh"; exit 1; }
