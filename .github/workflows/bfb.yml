@@ -104,27 +104,44 @@ jobs:
           set -euo pipefail
           sudo modprobe nbd max_part=16
           sudo qemu-nbd --connect=/dev/nbd0 "$QCOW"
-          sudo partprobe /dev/nbd0 || true
-          sleep 2
+          sudo partx -a /dev/nbd0 2>/dev/null || sudo partprobe /dev/nbd0 || true
+          for _ in $(seq 1 10); do ls /dev/nbd0p* >/dev/null 2>&1 && break; sleep 1; done
           mkdir -p mnt
-          # root partition is the largest; try p2 then p1.
-          root=/dev/nbd0p2; [ -b "$root" ] || root=/dev/nbd0p1
-          sudo mount "$root" mnt
-          # VyOS layout: boot/<version>/ holds vmlinuz + the *.squashfs image.
-          KVER=""
-          for d in mnt/boot/*/; do
-            b=$(basename "$d")
-            [ "$b" = "efi" ] && continue
-            [ -f "$d/vmlinuz" ] && { KVER="$b"; break; }
+
+          # VyOS installed layout (raw_image.py install_image): the root
+          # partition has boot/<DOZENOS-VERSION>/ holding the copied squashfs
+          # /boot/* files (vmlinuz-<KVER>, initrd, ...) plus <version>.squashfs.
+          # NOTE: the boot dir name is the DozenOS VERSION, not the kernel
+          # version; the kernel version comes from the vmlinuz-<KVER> filename
+          # and is what /lib/modules/<KVER> uses. Probe every partition.
+          imgdir="" vmlz=""
+          for part in /dev/nbd0p*; do
+            sudo mount "$part" mnt 2>/dev/null || continue
+            for d in mnt/boot/*/; do
+              for v in "$d"vmlinuz-*; do
+                [ -f "$v" ] || continue
+                imgdir="$d"; vmlz="$v"; break
+              done
+              [ -n "$vmlz" ] && break
+            done
+            [ -n "$vmlz" ] && break
+            sudo umount mnt
           done
-          [ -n "$KVER" ] || { echo "::error::no boot/<version>/vmlinuz found in the image"; exit 1; }
-          echo "I: detected kernel version dir: $KVER"
-          sudo cp "mnt/boot/$KVER/vmlinuz" ./vmlinuz
+          if [ -z "$vmlz" ]; then
+            echo "::error::no boot/*/vmlinuz-* found in any partition. Layout dump:"
+            for part in /dev/nbd0p*; do echo "-- $part --"; sudo mount "$part" mnt 2>/dev/null && { sudo find mnt -maxdepth 3 -name 'vmlinuz*' -o -maxdepth 3 -name '*.squashfs' 2>/dev/null; sudo ls -la mnt mnt/boot 2>/dev/null; sudo umount mnt; }; done
+            exit 1
+          fi
+          KVER=$(basename "$vmlz" | sed 's/^vmlinuz-//')
+          echo "I: kernel version: $KVER ; image boot dir: $imgdir"
+          sudo cp "$vmlz" ./vmlinuz
+
           sq=""
-          for f in mnt/boot/"$KVER"/*.squashfs; do [ -f "$f" ] && { sq="$f"; break; }; done
-          [ -n "$sq" ] || { echo "::error::no squashfs found under boot/$KVER"; exit 1; }
+          for f in "$imgdir"*.squashfs; do [ -f "$f" ] && { sq="$f"; break; }; done
+          [ -n "$sq" ] || { echo "::error::no *.squashfs under $imgdir"; exit 1; }
           mkdir -p sq
           sudo mount -o loop "$sq" sq
+          [ -d "sq/lib/modules/$KVER" ] || { echo "::error::sq/lib/modules/$KVER missing"; sudo ls sq/lib/modules; exit 1; }
           sudo cp -a "sq/lib/modules/$KVER" ./modules-"$KVER"
           sudo umount sq && sudo umount mnt
           sudo qemu-nbd --disconnect /dev/nbd0
