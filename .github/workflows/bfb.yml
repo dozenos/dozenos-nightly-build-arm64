@@ -26,9 +26,14 @@ on:
         required: false
         type: string
       doca_repo:
-        description: 'NVIDIA DOCA apt source line providing mlxbf-bootimages (aarch64).'
+        description: 'NVIDIA DOCA apt source line providing rshim (ships mlx-mkbfb).'
         required: true
-        default: 'deb [trusted=yes] https://linux.mellanox.com/public/repo/doca/latest/debian12.5/aarch64/ ./'
+        default: 'deb [trusted=yes] https://linux.mellanox.com/public/repo/doca/latest/debian12/arm64-sbsa/ ./'
+        type: string
+      bootimages_url:
+        description: 'URL of the mlxbf-bootimages(-signed) arm64 .deb (provides default.bfb). Per BF2 generation, not per board.'
+        required: true
+        default: 'https://linux.mellanox.com/public/repo/bluefield/latest/bootimages/prod/mlxbf-bootimages-signed_4.11.0-13611_arm64.deb'
         type: string
 
 permissions:
@@ -56,21 +61,25 @@ jobs:
           sudo apt-get install -y qemu-utils zstd busybox-static cpio gzip \
             gdisk kpartx ca-certificates wget
 
-      # mlxbf-bootimages provides /lib/firmware/mellanox/boot/default.bfb (+
-      # capsule) and /opt/mellanox/scripts/bin/mlx-mkbfb. The DOCA repo is
-      # public; [trusted=yes] in the source line avoids a key dance for a
-      # first bring-up (tighten to Signed-By once the exact keyring is pinned).
-      - name: Install NVIDIA mlxbf-bootimages + mlx-mkbfb (DOCA repo)
+      # Two public NVIDIA sources (both per BF2 generation, not per board):
+      #  - mlx-mkbfb ships in the DOCA repo's `rshim` package (/usr/sbin).
+      #  - default.bfb (+ capsule) ships in the mlxbf-bootimages-signed .deb
+      #    under the bluefield repo, fetched directly and dpkg -i'd.
+      # [trusted=yes] avoids a key dance for a first bring-up.
+      - name: Install mlx-mkbfb (DOCA rshim) + default.bfb (mlxbf-bootimages)
         run: |
           set -euo pipefail
           echo "${{ inputs.doca_repo }}" | sudo tee /etc/apt/sources.list.d/doca.list
           sudo apt-get update
-          sudo apt-get install -y mlxbf-bootimages
+          sudo apt-get install -y rshim
+          MKBFB=$(command -v mlx-mkbfb || echo /usr/sbin/mlx-mkbfb)
+          test -x "$MKBFB" || { echo "::error::mlx-mkbfb not found in the DOCA rshim package"; exit 1; }
+          echo "MKBFB=$MKBFB" >> "$GITHUB_ENV"
+
+          wget -qO bootimages.deb "${{ inputs.bootimages_url }}"
+          sudo dpkg -i bootimages.deb || sudo apt-get -y -f install
           test -f /lib/firmware/mellanox/boot/default.bfb \
             || { echo "::error::default.bfb not found after installing mlxbf-bootimages"; exit 1; }
-          MKBFB=$(command -v mlx-mkbfb || echo /opt/mellanox/scripts/bin/mlx-mkbfb)
-          test -x "$MKBFB" || { echo "::error::mlx-mkbfb not found (adjust the DOCA package set)"; exit 1; }
-          echo "MKBFB=$MKBFB" >> "$GITHUB_ENV"
 
       - name: Download the DPU qcow2 from the Release
         env:
