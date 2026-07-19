@@ -134,7 +134,26 @@ jobs:
           fi
           KVER=$(basename "$vmlz" | sed 's/^vmlinuz-//')
           echo "I: kernel version: $KVER ; image boot dir: $imgdir"
-          sudo cp "$vmlz" ./vmlinuz
+
+          # The BFB kernel MUST be the UNCOMPRESSED arm64 Image (PE/EFI header:
+          # "MZ" at 0x0, "ARMd" at 0x38). BF2 UEFI EFI-stub-boots it directly and
+          # CANNOT decompress a gzipped vmlinuz -- a gzip Image makes UEFI reject
+          # the "Linux from rshim" boot entry ("Failed to boot", hardware-observed)
+          # and fall through to the eMMC OS. So decompress if needed, exactly as
+          # NVIDIA bfb-build's create_bfb does (`$CAT vmlinuz > image`, zcat when
+          # file(1) reports gzip). Verified on a real BF2: gzip -> Failed to boot;
+          # uncompressed -> entry accepted.
+          sudo cp "$vmlz" ./kernel.raw
+          sudo chown "$(id -u):$(id -g)" ./kernel.raw
+          case "$(file --brief --mime-type ./kernel.raw)" in
+            application/gzip|application/x-gzip) zcat ./kernel.raw > ./vmlinuz ;;
+            *)                                   mv ./kernel.raw ./vmlinuz ;;
+          esac
+          rm -f ./kernel.raw
+          if ! cmp -s <(head -c 2 ./vmlinuz) <(printf 'MZ'); then
+            echo "::error::extracted kernel is not an uncompressed arm64 Image (no MZ header); UEFI cannot EFI-stub-boot it"
+            file ./vmlinuz; exit 1
+          fi
 
           sq=""
           for f in "$imgdir"*.squashfs; do [ -f "$f" ] && { sq="$f"; break; }; done
@@ -161,13 +180,13 @@ jobs:
         run: |
           set -euo pipefail
           cap=/lib/firmware/mellanox/boot/capsule/boot_update2.cap
-          caparg=""; [ -f "$cap" ] && caparg="--capsule $cap"
+          caparg=(); [ -f "$cap" ] && caparg=(--capsule "$cap")
           rebrand-arm64/bfb/make-bfb.sh \
             --mkbfb "$MKBFB" \
             --base-bfb /lib/firmware/mellanox/boot/default.bfb \
             --kernel ./vmlinuz \
             --initramfs installer.cpio.gz \
-            $caparg \
+            "${caparg[@]}" \
             --out "dozenos-${TAG}-bf2.bfb"
 
       - name: Upload the .bfb to the Release
