@@ -177,12 +177,6 @@ jobs:
           sudo mount -o loop "$sq" sq
           [ -d "sq/lib/modules/$KVER" ] || { echo "::error::sq/lib/modules/$KVER missing"; sudo ls sq/lib/modules; exit 1; }
           sudo cp -a "sq/lib/modules/$KVER" ./modules-"$KVER"
-
-          # The installer seeds the target's config.boot with a serial console;
-          # take the image's own default while the squashfs is open here, so the
-          # installer needs neither squashfs nor loop on the DPU.
-          sudo cp sq/usr/share/dozenos/config.boot.default ./config.boot.default
-          sudo chown "$(id -u):$(id -g)" ./config.boot.default
           sudo umount sq && sudo umount mnt
           sudo qemu-nbd --disconnect /dev/nbd0
           echo "KVER=$KVER" >> "$GITHUB_ENV"
@@ -195,7 +189,6 @@ jobs:
             --busybox /usr/bin/busybox \
             --modules-dir "./modules-$KVER" \
             --kver "$KVER" \
-            --config-boot-default ./config.boot.default \
             --out installer.cpio.gz
 
       - name: Pack the BFB
