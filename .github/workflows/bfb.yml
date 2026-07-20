@@ -50,13 +50,41 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-bfb:
-    # On workflow_run only proceed if the nightly succeeded; always run on manual
-    # dispatch. (workflow_run carries no inputs, so the steps fall back to the
-    # workflow_dispatch defaults below.)
+  # A change-gated nightly that built nothing still reports success, so the
+  # auto-chain would re-wrap the previous release on every run. Resolve the tag
+  # once here and skip when that release already has its .bfb -- a fresh nightly
+  # always publishes a new tag, which by definition has none yet.
+  gate:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.decide.outputs.tag }}
+      skip: ${{ steps.decide.outputs.skip }}
+    steps:
+      - name: Resolve the release tag and decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.release_tag }}"
+          [ -n "$TAG" ] || TAG=$(gh release list -R "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          has_bfb=$(gh release view "$TAG" -R "${{ github.repository }}" --json assets \
+                      --jq '[.assets[].name] | any(endswith("-bf2.bfb"))')
+          if [ "${{ github.event_name }}" = "workflow_run" ] && [ "$has_bfb" = "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "I: $TAG already carries a .bfb -- the nightly published nothing new, skipping"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "I: wrapping $TAG"
+          fi
+
+  build-bfb:
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     env:
@@ -101,22 +129,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="${{ inputs.release_tag }}"
-          [ -n "$TAG" ] || TAG=$(gh release list -R "${{ github.repository }}" --limit 1 --json tagName --jq '.[0].tagName')
-          echo "I: wrapping release $TAG"
+          TAG="${{ needs.gate.outputs.tag }}"
           echo "TAG=$TAG" >> "$GITHUB_ENV"
-          # A nightly that the change-gate skipped still reports success, so the
-          # workflow_run chain fires and would re-wrap a release that already
-          # has its .bfb. Nothing breaks (the upload is --clobber) but it costs
-          # a runner for no new bits, so stop here instead. A manual dispatch
-          # always proceeds -- that is how you rebuild a .bfb deliberately.
-          if [ "${{ github.event_name }}" = "workflow_run" ] \
-             && gh release view "$TAG" -R "${{ github.repository }}" \
-                  --json assets --jq '[.assets[].name]|join(" ")' | grep -q -- '-bf2.bfb'; then
-            echo "I: release $TAG already carries a .bfb and this run was auto-chained -- nothing to do"
-            echo "SKIP=1" >> "$GITHUB_ENV"
-            exit 0
-          fi
           gh release download "$TAG" -R "${{ github.repository }}" \
             --pattern '*-dpu-arm64.qcow2' --dir .
           qcow=$(ls ./*-dpu-arm64.qcow2)
@@ -127,7 +141,6 @@ jobs:
       # squashfs it carries, and copy vmlinuz + modules for the installer
       # initramfs.
       - name: Extract kernel Image + modules from the qcow2
-        if: env.SKIP != '1'
         run: |
           set -euo pipefail
           sudo modprobe nbd max_part=16
@@ -195,7 +208,6 @@ jobs:
           echo "KVER=$KVER" >> "$GITHUB_ENV"
 
       - name: Build installer initramfs
-        if: env.SKIP != '1'
         run: |
           set -euo pipefail
           sudo rebrand-arm64/bfb/create-installer-initramfs.sh \
@@ -206,7 +218,6 @@ jobs:
             --out installer.cpio.gz
 
       - name: Pack the BFB
-        if: env.SKIP != '1'
         run: |
           set -euo pipefail
           cap=/lib/firmware/mellanox/boot/capsule/boot_update2.cap
@@ -225,7 +236,6 @@ jobs:
       # if the key does need one, minisign fails here rather than silently
       # producing nothing).
       - name: Sign the .bfb
-        if: env.SKIP != '1'
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
@@ -246,7 +256,6 @@ jobs:
           echo "I: signed dozenos-${TAG}-bf2.bfb"
 
       - name: Upload the .bfb + signature to the Release
-        if: env.SKIP != '1'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
