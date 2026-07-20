@@ -12,7 +12,7 @@
 # board-specific input.
 #
 # What it does: pull the DPU qcow2 from a nightly Release -> extract the
-# kernel Image + modules from it -> build the dd-installer initramfs
+# kernel Image + modules from it -> build the installer initramfs
 # (dozenos-rebrand-arm64/bfb/create-installer-initramfs.sh) -> pack with
 # NVIDIA default.bfb via mlx-mkbfb (bfb/make-bfb.sh) -> upload the .bfb to the
 # same Release.
@@ -34,12 +34,12 @@ on:
       doca_repo:
         description: 'NVIDIA DOCA apt source line providing rshim (ships mlx-mkbfb).'
         required: true
-        default: 'deb [trusted=yes] https://linux.mellanox.com/public/repo/doca/latest/debian12/arm64-sbsa/ ./'
+        default: 'deb [trusted=yes] https://linux.mellanox.com/public/repo/doca/3.4.0/debian12/arm64-sbsa/ ./'
         type: string
       bootimages_url:
         description: 'URL of the mlxbf-bootimages(-signed) arm64 .deb (provides default.bfb + capsule). Per BF2 generation, not per board. Pin a recent DOCA build so a push does not downgrade the DPU firmware (a 4.11 base was seen to revert a 4.15 board).'
         required: true
-        default: 'https://linux.mellanox.com/public/repo/doca/latest/debian13/arm64-dpu/mlxbf-bootimages-signed_4.15.0-13977_arm64.deb'
+        default: 'https://linux.mellanox.com/public/repo/doca/3.4.0/debian13/arm64-dpu/mlxbf-bootimages-signed_4.15.0-13977_arm64.deb'
         type: string
 
 permissions:
@@ -60,8 +60,8 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     env:
-      DOCA_REPO: ${{ inputs.doca_repo || 'deb [trusted=yes] https://linux.mellanox.com/public/repo/doca/latest/debian12/arm64-sbsa/ ./' }}
-      BOOTIMAGES_URL: ${{ inputs.bootimages_url || 'https://linux.mellanox.com/public/repo/doca/latest/debian13/arm64-dpu/mlxbf-bootimages-signed_4.15.0-13977_arm64.deb' }}
+      DOCA_REPO: ${{ inputs.doca_repo || 'deb [trusted=yes] https://linux.mellanox.com/public/repo/doca/3.4.0/debian12/arm64-sbsa/ ./' }}
+      BOOTIMAGES_URL: ${{ inputs.bootimages_url || 'https://linux.mellanox.com/public/repo/doca/3.4.0/debian13/arm64-dpu/mlxbf-bootimages-signed_4.15.0-13977_arm64.deb' }}
     steps:
       - name: Checkout dozenos-rebrand-arm64 (bfb/ scripts)
         uses: actions/checkout@v7
@@ -74,7 +74,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y qemu-utils zstd busybox-static cpio gzip \
-            gdisk kpartx ca-certificates wget efibootmgr pv
+            gdisk kpartx ca-certificates wget efibootmgr
 
       # Two public NVIDIA sources (both per BF2 generation, not per board):
       #  - mlx-mkbfb ships in the DOCA repo's `rshim` package (/usr/sbin).
@@ -181,7 +181,7 @@ jobs:
           sudo qemu-nbd --disconnect /dev/nbd0
           echo "KVER=$KVER" >> "$GITHUB_ENV"
 
-      - name: Build installer initramfs (dd model)
+      - name: Build installer initramfs
         run: |
           set -euo pipefail
           sudo rebrand-arm64/bfb/create-installer-initramfs.sh \
