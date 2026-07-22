@@ -1,52 +1,52 @@
 {
-  "version": "2026.07.20-1234-rolling",
+  "version": "2026.07.22-1229-rolling",
   "iso": {
-    "name": "dozenos-2026.07.20-1234-rolling-generic-arm64.iso",
-    "sha256": "b064b5bbee67c0153340c56b11520d4cb66d03eadfad03454c87960a1db91dd4",
-    "url": "https://github.com/dozenos/dozenos-nightly-build-arm64/releases/download/2026.07.20-1234-rolling/dozenos-2026.07.20-1234-rolling-generic-arm64.iso"
+    "name": "dozenos-2026.07.22-1229-rolling-generic-arm64.iso",
+    "sha256": "eb640ba714ff287a7b479ff74261f310fcf4785cb9b0a5ca4299c7efa80c7f47",
+    "url": "https://github.com/dozenos/dozenos-nightly-build-arm64/releases/download/2026.07.22-1229-rolling/dozenos-2026.07.22-1229-rolling-generic-arm64.iso"
   },
   "minisig": {
-    "name": "dozenos-2026.07.20-1234-rolling-generic-arm64.iso.minisig",
-    "url": "https://github.com/dozenos/dozenos-nightly-build-arm64/releases/download/2026.07.20-1234-rolling/dozenos-2026.07.20-1234-rolling-generic-arm64.iso.minisig"
+    "name": "dozenos-2026.07.22-1229-rolling-generic-arm64.iso.minisig",
+    "url": "https://github.com/dozenos/dozenos-nightly-build-arm64/releases/download/2026.07.22-1229-rolling/dozenos-2026.07.22-1229-rolling-generic-arm64.iso.minisig"
   },
   "artifacts": [
     {
       "flavor": "dpu",
       "install_type": "fresh-install",
       "format": "iso",
-      "name": "dozenos-2026.07.20-1234-rolling-dpu-arm64.iso",
-      "sha256": "9d6211c8f2f76bafad21d02cf853eae38f706d6b66c902d193a4bc0e0a82cece",
-      "url": "https://github.com/dozenos/dozenos-nightly-build-arm64/releases/download/2026.07.20-1234-rolling/dozenos-2026.07.20-1234-rolling-dpu-arm64.iso",
+      "name": "dozenos-2026.07.22-1229-rolling-dpu-arm64.iso",
+      "sha256": "dfd650e42d37760af275a3f09a2a485449e91baf3e13644d93659b114b3f0c8b",
+      "url": "https://github.com/dozenos/dozenos-nightly-build-arm64/releases/download/2026.07.22-1229-rolling/dozenos-2026.07.22-1229-rolling-dpu-arm64.iso",
       "minisig": {
-        "name": "dozenos-2026.07.20-1234-rolling-dpu-arm64.iso.minisig",
-        "url": "https://github.com/dozenos/dozenos-nightly-build-arm64/releases/download/2026.07.20-1234-rolling/dozenos-2026.07.20-1234-rolling-dpu-arm64.iso.minisig"
+        "name": "dozenos-2026.07.22-1229-rolling-dpu-arm64.iso.minisig",
+        "url": "https://github.com/dozenos/dozenos-nightly-build-arm64/releases/download/2026.07.22-1229-rolling/dozenos-2026.07.22-1229-rolling-dpu-arm64.iso.minisig"
       }
     },
     {
       "flavor": "dpu",
       "install_type": "fresh-install",
       "format": "qcow2",
-      "name": "dozenos-2026.07.20-1234-rolling-dpu-arm64.qcow2",
-      "sha256": "22ac576657ce41cbb913ac18c8aa219ff93779f472e7a291b3982295d3765aed",
-      "url": "https://github.com/dozenos/dozenos-nightly-build-arm64/releases/download/2026.07.20-1234-rolling/dozenos-2026.07.20-1234-rolling-dpu-arm64.qcow2",
+      "name": "dozenos-2026.07.22-1229-rolling-dpu-arm64.qcow2",
+      "sha256": "aa72efa6bf7ce2d205cceb8f58dba2a4c77f805340e18c87b75ad238a5d18fcd",
+      "url": "https://github.com/dozenos/dozenos-nightly-build-arm64/releases/download/2026.07.22-1229-rolling/dozenos-2026.07.22-1229-rolling-dpu-arm64.qcow2",
       "minisig": {
-        "name": "dozenos-2026.07.20-1234-rolling-dpu-arm64.qcow2.minisig",
-        "url": "https://github.com/dozenos/dozenos-nightly-build-arm64/releases/download/2026.07.20-1234-rolling/dozenos-2026.07.20-1234-rolling-dpu-arm64.qcow2.minisig"
+        "name": "dozenos-2026.07.22-1229-rolling-dpu-arm64.qcow2.minisig",
+        "url": "https://github.com/dozenos/dozenos-nightly-build-arm64/releases/download/2026.07.22-1229-rolling/dozenos-2026.07.22-1229-rolling-dpu-arm64.qcow2.minisig"
       }
     },
     {
       "flavor": "generic",
       "install_type": "fresh-install",
       "format": "iso",
-      "name": "dozenos-2026.07.20-1234-rolling-generic-arm64.iso",
-      "sha256": "b064b5bbee67c0153340c56b11520d4cb66d03eadfad03454c87960a1db91dd4",
-      "url": "https://github.com/dozenos/dozenos-nightly-build-arm64/releases/download/2026.07.20-1234-rolling/dozenos-2026.07.20-1234-rolling-generic-arm64.iso",
+      "name": "dozenos-2026.07.22-1229-rolling-generic-arm64.iso",
+      "sha256": "eb640ba714ff287a7b479ff74261f310fcf4785cb9b0a5ca4299c7efa80c7f47",
+      "url": "https://github.com/dozenos/dozenos-nightly-build-arm64/releases/download/2026.07.22-1229-rolling/dozenos-2026.07.22-1229-rolling-generic-arm64.iso",
       "minisig": {
-        "name": "dozenos-2026.07.20-1234-rolling-generic-arm64.iso.minisig",
-        "url": "https://github.com/dozenos/dozenos-nightly-build-arm64/releases/download/2026.07.20-1234-rolling/dozenos-2026.07.20-1234-rolling-generic-arm64.iso.minisig"
+        "name": "dozenos-2026.07.22-1229-rolling-generic-arm64.iso.minisig",
+        "url": "https://github.com/dozenos/dozenos-nightly-build-arm64/releases/download/2026.07.22-1229-rolling/dozenos-2026.07.22-1229-rolling-generic-arm64.iso.minisig"
       }
     }
   ],
   "minisign_pubkey_file": "minisign.pub",
-  "published_at": "2026-07-20T12:48:32Z"
+  "published_at": "2026-07-22T13:54:40Z"
 }
