@@ -51,7 +51,7 @@ on:
     # Mondays 05:17 UTC -- ~1h after the amd64 nightly heartbeat
     # ('17 4 * * 1') and well after the mirrors' 03:17 self-sync and this
     # repo's 02:30 container refresh.
-    - cron: '17 5 * * 1'
+    - cron: '17 20 * * 1'
   workflow_dispatch:
     inputs:
       version_override:
